@@ -131,8 +131,9 @@ flat/desaturated drift vs the native Qwen VAE. Keys: `linear_M` (3×3), `linear_
 run the fitter in the `anima_lora` repo:
 
 ```bash
-uv run python bench/pid/fit_color_calib.py --num_images 24 --steps 4
-# -> bench/pid/results/<ts>-colorcalib/pid_color_calib.safetensors
+# the bundled calib was fit one-(middle)-latent-per-artist over the full dataset:
+uv run python bench/pid/fit_color_calib.py --one_per_artist --num_images 0 --steps 4
+# -> bench/pid/results/<ts>-per-artist/pid_color_calib.safetensors
 ```
 
 It decodes cached Anima latents both ways (native Qwen VAE reference vs PiD), then

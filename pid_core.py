@@ -142,6 +142,39 @@ def comfy_latent_to_lq(samples: torch.Tensor, device, dtype=torch.bfloat16) -> t
 # Nets whose transformer blocks have been compiled in place (idempotent guard).
 _COMPILED_NETS: set = set()
 
+# Tri-state cache: None = not yet probed, True/False = inductor build works here.
+_COMPILE_OK = None
+
+
+def _compiler_available(device, dtype) -> bool:
+    """Probe (once) whether torch.compile's inductor backend can actually build a
+    kernel on this machine, falling back to eager if not.
+
+    torch.compile is lazy: `torch.compile(f)` never fails, the build happens at the
+    first *call* of the compiled graph — deep inside the sample loop. On Windows
+    inductor needs MSVC's ``cl.exe`` for its C++ wrapper; many installs lack it and
+    hit ``Compiler: cl is not found`` mid-decode, crashing an otherwise-fine run.
+    Probing a trivial compiled op up front lets us downgrade to eager with one clear
+    message instead. Result is cached for the process."""
+    global _COMPILE_OK
+    if _COMPILE_OK is not None:
+        return _COMPILE_OK
+    try:
+        g = torch.compile(lambda x: x * 2.0 + 1.0, mode="default", dynamic=False)
+        with torch.no_grad():
+            g(torch.zeros(8, device=device, dtype=dtype))
+        _COMPILE_OK = True
+    except Exception as e:  # noqa: BLE001 — any build failure -> eager fallback
+        first = (str(e).splitlines() or [""])[0]
+        print(
+            f"[AnimaPiD] torch.compile unavailable here ({type(e).__name__}: {first}); "
+            f"decoding eagerly (the 'compile' toggle is a no-op on this machine).\n"
+            f"[AnimaPiD] Windows: install MSVC Build Tools so 'cl.exe' is on PATH to "
+            f"enable compile; otherwise just leave the Decode node's 'compile' off."
+        )
+        _COMPILE_OK = False
+    return _COMPILE_OK
+
 
 def _compile_blocks_inplace(net: PidNet) -> None:
     """Per-block `torch.compile`, mirroring anima_lora's `DiT.compile_blocks` and
@@ -168,12 +201,17 @@ def _compile_blocks_inplace(net: PidNet) -> None:
 
 
 def get_runner(net: PidNet, dtype, enable: bool) -> PidNet:
-    """Return the net to call in the sample loop. With `enable`, the net's
-    transformer blocks are torch.compiled in place, once, per-block (see
-    `_compile_blocks_inplace`) and the same (now-compiled) net is returned;
-    without it, the eager net is returned unchanged."""
+    """Return the net to call in the sample loop. With `enable` AND a working
+    inductor backend on this machine, the net's transformer blocks are
+    torch.compiled in place, once, per-block (see `_compile_blocks_inplace`) and the
+    same (now-compiled) net is returned; otherwise the eager net is returned
+    unchanged. The `_compiler_available` probe guards against machines without a host
+    C compiler (e.g. Windows lacking `cl.exe`), where compiling would crash the
+    decode at first block execution rather than at compile time."""
     if enable:
-        _compile_blocks_inplace(net)
+        device = next(net.parameters()).device
+        if _compiler_available(device, dtype):
+            _compile_blocks_inplace(net)
     return net
 
 

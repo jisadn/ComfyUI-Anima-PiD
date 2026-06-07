@@ -26,6 +26,7 @@ import shutil
 import torch
 
 import comfy.model_management as mm
+import comfy.model_patcher
 import folder_paths
 from comfy.utils import ProgressBar
 
@@ -102,11 +103,21 @@ def _download_official_ckpt() -> str:
 
 
 class AnimaPiDModel:
-    """Holder for a loaded PiD net + its compute dtype (ANIMA_PID socket)."""
+    """Holder for a ModelPatcher-wrapped PiD net + its compute dtype (ANIMA_PID socket).
 
-    def __init__(self, net, dtype):
-        self.net = net
+    The net is wrapped in a comfy ModelPatcher so ComfyUI's model manager owns its
+    VRAM residency exactly like a UNET/VAE: it rests on the offload (CPU) device and
+    is pulled onto the GPU — evicting other models as needed — via load_models_gpu at
+    decode time, then evicted on-demand when something else needs the VRAM. `.net` is
+    the underlying module (what the pid_core decode fns consume)."""
+
+    def __init__(self, patcher, dtype):
+        self.patcher = patcher
         self.dtype = dtype
+
+    @property
+    def net(self):
+        return self.patcher.model
 
 
 class AnimaPiDLoader:
@@ -151,8 +162,16 @@ class AnimaPiDLoader:
                 f"model_ema_bf16.pth and place it there, or select the auto-download entry."
             )
         dt = _DTYPES[dtype]
-        device = mm.get_torch_device()
-        net = build_pid_net(device, dt)
+        # Build the net on the OFFLOAD (CPU) device, not the GPU — the same load/
+        # offload split every core ComfyUI loader uses (UNETLoader builds on the
+        # offload device and hands a ModelPatcher to the manager; see comfy.sd.
+        # load_diffusion_model_state_dict). The patcher (below) then lets ComfyUI's
+        # model manager own residency: it stays on CPU until decode pulls it onto
+        # the GPU via load_models_gpu, and is evicted on-demand when something else
+        # (e.g. the next KSampler run) needs the VRAM.
+        load_device = mm.get_torch_device()
+        offload_device = mm.unet_offload_device()
+        net = build_pid_net(offload_device, dt)
         missing, unexpected = load_pid_weights(net, path)
         expected_missing, suspect_missing, unexpected = categorize_load_keys(missing, unexpected)
         if expected_missing:
@@ -167,8 +186,14 @@ class AnimaPiDLoader:
                 f"  {len(unexpected)} UNEXPECTED keys (e.g. {unexpected[:3]})\n"
                 f"  Decode may produce garbage. Verify NET_KWARGS against the checkpoint."
             )
-        print(f"[AnimaPiD] loaded {ckpt_name} as {dtype} on {device}")
-        return (AnimaPiDModel(net, dt),)
+        # Hand the net to ComfyUI's model manager via a ModelPatcher (no patches —
+        # we only want its load/offload lifecycle, not weight patching). With no
+        # comfy-cast modules the manager simply full-loads it onto the GPU and
+        # evicts it whole when VRAM is needed, which is exactly the residency
+        # convention we want for a decode-time model.
+        patcher = comfy.model_patcher.ModelPatcher(net, load_device=load_device, offload_device=offload_device)
+        print(f"[AnimaPiD] loaded {ckpt_name} as {dtype} (offload={offload_device}, load={load_device}; ComfyUI-managed)")
+        return (AnimaPiDModel(patcher, dt),)
 
 
 class AnimaPiDDecode:
@@ -258,16 +283,24 @@ class AnimaPiDDecode:
 
     def decode(self, pid_model, latent, steps, sigma, seed, tile_latent, tile_overlap,
                compile=False, use_calib=True, attention="auto"):
-        net = pid_model.net
+        patcher = pid_model.patcher
         dt = pid_model.dtype
-        device = mm.get_torch_device()
+        load_device = patcher.load_device
+
+        # Hand residency to ComfyUI's model manager: this evicts the KSampler DiT
+        # (and anything else) as needed and brings the PiD net onto the GPU, then
+        # leaves it loaded so the manager can evict it on-demand when the next run
+        # needs the VRAM. No manual offload — the manager owns the lifecycle, so a
+        # net kept resident across decodes also keeps its compiled blocks warm.
+        mm.load_models_gpu([patcher])
+        net = patcher.model
 
         # "auto" -> None defers to the launch flags; otherwise force the backend.
         set_attention_backend(None if attention == "auto" else attention)
 
-        cap = self._null_caption(device, dt)
+        cap = self._null_caption(load_device, dt)
 
-        lq = comfy_latent_to_lq(latent["samples"], device, dt)  # (B,16,h,w) normalized
+        lq = comfy_latent_to_lq(latent["samples"], load_device, dt)  # (B,16,h,w) normalized
         lh, lw = lq.shape[-2], lq.shape[-1]
         out_h, out_w = lh * VAE_DOWN * SR_SCALE, lw * VAE_DOWN * SR_SCALE
         print(f"[AnimaPiD] decode latent {lh}x{lw} -> {out_h}x{out_w} ({SR_SCALE}x), "
@@ -293,7 +326,7 @@ class AnimaPiDDecode:
         # (B,3,H,W) in [-1,1] -> ComfyUI IMAGE (B,H,W,3) in [0,1]
         img = ((px.float() + 1.0) / 2.0).clamp(0, 1).permute(0, 2, 3, 1).contiguous()
         if use_calib:
-            M, b = self._color_calib(device)
+            M, b = self._color_calib(load_device)
             img = apply_color_calib(img, M, b)  # PiD->native-VAE color match (channel-last)
         return (img.cpu(),)
 

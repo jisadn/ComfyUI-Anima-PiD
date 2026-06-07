@@ -180,8 +180,12 @@ def comfy_latent_to_lq(samples: torch.Tensor, device, dtype=torch.bfloat16) -> t
     return lq.to(device=device, dtype=dtype)
 
 
-# Nets whose transformer blocks have been compiled in place (idempotent guard).
-_COMPILED_NETS: set = set()
+# Whether a net's transformer blocks are already compiled is tracked by a flag set
+# ON the net object (see _compile_blocks_inplace) rather than a module-level id()
+# set: an id() set both leaks across the process and can mis-fire if a freed net's
+# address is reused. A per-object attribute is GC'd with the net and survives the
+# ComfyUI ModelPatcher's evict/reload (which moves the *same* object CPU<->GPU,
+# never recreates it), so the compile stays a one-shot per net.
 
 # Tri-state cache: None = not yet probed, True/False = host C++ compiler present.
 _COMPILE_OK = None
@@ -255,15 +259,18 @@ def _compile_blocks_inplace(net: PidNet) -> None:
     caches` dance the whole-net path needed, and the eager net-level forward keeps
     building those caches as normal.
 
-    Idempotent (compiles once per net). Output-resolution changes are handled by
-    dynamo's own per-shape specialization — a new size recompiles automatically;
-    tiled decode keeps every tile the same size, so the blocks compile just once."""
-    if id(net) in _COMPILED_NETS:
+    Idempotent (compiles once per net), guarded by a flag on the net object so the
+    one-shot survives the ModelPatcher's evict/reload without re-wrapping. Output-
+    resolution changes are handled by dynamo's own per-shape specialization — a new
+    size recompiles automatically; tiled decode keeps every tile the same size, so
+    the blocks compile just once. (A CPU<->GPU move from an eviction does make dynamo
+    re-specialize per device on the next forward, but the wrappers are reused.)"""
+    if getattr(net, "_pid_blocks_compiled", False):
         return
     for blocks in (net.patch_blocks, net.pixel_blocks):
         for i in range(len(blocks)):
             blocks[i] = torch.compile(blocks[i], mode="default", dynamic=False)
-    _COMPILED_NETS.add(id(net))
+    net._pid_blocks_compiled = True
 
 
 def get_runner(net: PidNet, dtype, enable: bool) -> PidNet:

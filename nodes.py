@@ -45,6 +45,7 @@ from .pid_core import (
     pid_decode_latent,
     pid_decode_latent_tiled,
 )
+from .pid_net.attention_backend import set_attention_backend
 
 # Register a ComfyUI models/pid folder for PiD checkpoints (.pth / .safetensors).
 _PID_DIR = os.path.join(folder_paths.models_dir, "pid")
@@ -201,6 +202,12 @@ class AnimaPiDDecode:
                                                      "desaturated vs the native Qwen VAE (a known PiD drift, fixed "
                                                      "upstream only for the flux2 checkpoint); this corrects the "
                                                      "systematic part. Turn off for raw PiD output."}),
+                "attention": (["auto", "sdpa", "flash", "sage"], {"default": "auto",
+                                          "tooltip": "Attention backend for the PiD net. 'auto' honors ComfyUI's "
+                                                     "--use-sage-attention / --use-flash-attention launch flags (sage "
+                                                     "wins), else plain SDPA. 'sdpa' already runs PyTorch's built-in "
+                                                     "flash kernel here, so 'flash' is ~identical; 'sage' (INT8) is the "
+                                                     "real speedup. Masked/fp32/CPU paths always fall back to SDPA."}),
             }
         }
 
@@ -250,10 +257,13 @@ class AnimaPiDDecode:
         return (M, b)
 
     def decode(self, pid_model, latent, steps, sigma, seed, tile_latent, tile_overlap,
-               compile=False, use_calib=True):
+               compile=False, use_calib=True, attention="auto"):
         net = pid_model.net
         dt = pid_model.dtype
         device = mm.get_torch_device()
+
+        # "auto" -> None defers to the launch flags; otherwise force the backend.
+        set_attention_backend(None if attention == "auto" else attention)
 
         cap = self._null_caption(device, dt)
 

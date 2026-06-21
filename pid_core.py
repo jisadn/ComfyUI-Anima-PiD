@@ -300,7 +300,7 @@ def _t_list(num_steps: int, device) -> torch.Tensor:
 def pid_decode_latent(net: PidNet, lq_latent: torch.Tensor, *, steps: int = 4,
                       sigma: float = 0.0, seed: int = 0, dtype=torch.bfloat16,
                       compile: bool = False, caption_embs: torch.Tensor = None,
-                      _runner=None, step_cb=None) -> torch.Tensor:
+                      _runner=None, step_cb=None, lq_features=None) -> torch.Tensor:
     """Run the 4-step SDE student. lq_latent: (B,16,h,w) normalized.
     Returns pixels (B,3,H,W) in [-1,1] with H=h*8*4, W=w*8*4.
 
@@ -310,7 +310,11 @@ def pid_decode_latent(net: PidNet, lq_latent: torch.Tensor, *, steps: int = 4,
     `compile=True` torch.compiles the net (cached per output resolution; first
     call per (H,W) is slow). `_runner` lets callers (e.g. the tiled path) pass a
     pre-built compiled net so all same-size tiles share one graph. `step_cb`, if
-    given, is called once per completed SDE step (drives a host progress bar)."""
+    given, is called once per completed SDE step (drives a host progress bar).
+    `lq_features`, if given, is a precomputed per-block LQ token list (already
+    sliced to this call's patch grid) that bypasses the net's own LQ projection —
+    the tiled decoder uses it so every tile conditions on whole-image-normalized
+    features (see `pid_decode_latent_tiled`)."""
     device = lq_latent.device
     B, _, lh, lw = lq_latent.shape
     H, W = lh * VAE_DOWN * SR_SCALE, lw * VAE_DOWN * SR_SCALE
@@ -331,7 +335,10 @@ def pid_decode_latent(net: PidNet, lq_latent: torch.Tensor, *, steps: int = 4,
     with autocast:
         for t_cur, t_next in zip(tl[:-1], tl[1:]):
             t_scaled = t_cur.expand(B) * FM_TIMESCALE
-            v = run(x.to(dtype), t_scaled, cap, lq_latent=lq_latent, degrade_sigma=deg)
+            if lq_features is not None:
+                v = run(x.to(dtype), t_scaled, cap, lq_features=lq_features, degrade_sigma=deg)
+            else:
+                v = run(x.to(dtype), t_scaled, cap, lq_latent=lq_latent, degrade_sigma=deg)
             s = [B] + [1] * (x.ndim - 1)
             t_c = t_cur.double().view(*s)
             x0 = (x.double() - t_c * v.double())  # velocity -> x0
@@ -383,11 +390,21 @@ def pid_decode_latent_tiled(net: PidNet, lq_latent: torch.Tensor, *, steps: int 
                             sigma: float = 0.0, seed: int = 0, tile: int = 64,
                             overlap: int = 16, dtype=torch.bfloat16,
                             compile: bool = False, caption_embs: torch.Tensor = None,
-                            step_cb=None) -> torch.Tensor:
+                            step_cb=None, global_lq: bool = True) -> torch.Tensor:
     """Tiled SR decode for latents larger than `tile` (memory bound). Decodes
     overlapping latent tiles and feather-blends them in pixel space. Output
     (B,3, h*32, w*32) in [-1,1]. `step_cb` ticks once per SDE step across all
-    tiles (total ticks = steps * count_tiles())."""
+    tiles (total ticks = steps * count_tiles()).
+
+    `global_lq` (default True) makes the LQ conditioning tile-invariant: the LQ
+    projection — whose ResBlocks carry GroupNorm, which normalizes over the whole
+    spatial extent — is run ONCE on the full latent, then each tile is handed its
+    sliced token rows. Without it, every tile re-projects its own crop, so its
+    GroupNorm sees only tile-local statistics and the output tone drifts vs the
+    whole-image decode (the cause of the tile=0 vs tiled color mismatch). The LQ
+    projection runs at latent/patch-grid resolution, so this whole-latent pass is
+    cheap even when the full pixel decode would OOM. Set False for the legacy
+    per-tile behavior (matches the pre-fix shipped color calibration)."""
     device = lq_latent.device
     B, _, Hh, Ww = lq_latent.shape
     up = VAE_DOWN * SR_SCALE  # 32
@@ -406,13 +423,34 @@ def pid_decode_latent_tiled(net: PidNet, lq_latent: torch.Tensor, *, steps: int 
     # All tiles share one fixed output size -> blocks compile once, reuse for every tile.
     runner = get_runner(net, dtype, compile)
 
+    # Tile-invariant LQ conditioning: project the FULL latent once (GroupNorm sees
+    # whole-image stats), then slice each tile's token rows. The patch grid is
+    # `r = up // patch_size` cells per latent cell, so a latent tile [yi:yi+th]
+    # maps to patch rows [yi*r:(yi+th)*r].
+    full_feats_2d = None
+    if global_lq:
+        r = up // net.patch_size
+        full_pH, full_pW = Hh * r, Ww * r
+        autocast = (torch.autocast("cuda", dtype=dtype) if device.type == "cuda"
+                    else torch.autocast("cpu", dtype=dtype))
+        with autocast:
+            full_feats = net.lq_proj(lq_latent=lq_latent.to(dtype),
+                                     target_pH=full_pH, target_pW=full_pW)
+        full_feats_2d = [f.view(B, full_pH, full_pW, -1) for f in full_feats]
+
     n = 0
     for yi in ys:
         for xi in xs:
+            tile_feats = None
+            if full_feats_2d is not None:
+                r = up // net.patch_size
+                y0, y1, x0, x1 = yi * r, (yi + th) * r, xi * r, (xi + tw) * r
+                tile_feats = [f[:, y0:y1, x0:x1, :].reshape(B, (y1 - y0) * (x1 - x0), -1).contiguous()
+                              for f in full_feats_2d]
             tile_lq = lq_latent[..., yi:yi + th, xi:xi + tw]
             px = pid_decode_latent(net, tile_lq, steps=steps, sigma=sigma, seed=seed + n,
                                    dtype=dtype, caption_embs=caption_embs,
-                                   _runner=runner, step_cb=step_cb)
+                                   _runner=runner, step_cb=step_cb, lq_features=tile_feats)
             py, px_ = yi * up, xi * up
             acc[..., py:py + th * up, px_:px_ + tw * up] += px.float() * wmask
             wsum[..., py:py + th * up, px_:px_ + tw * up] += wmask

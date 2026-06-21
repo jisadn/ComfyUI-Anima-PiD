@@ -273,6 +273,14 @@ class PidNet(PixDiT_T2I):
         lq_latent=None,
         lq_mask=None,
         degrade_sigma=None,
+        # --- Precomputed LQ features (tile-invariant conditioning) ---
+        # When supplied, _compute_lq_features() is bypassed entirely and these
+        # token features are injected as-is. The tiled decoder uses this to run
+        # the LQ projection ONCE over the full latent (so its GroupNorm sees the
+        # whole-image spatial statistics) and hand each tile its sliced token
+        # rows — making tiled output match the whole-image decode. Must already
+        # be a list matching this call's (Hs, Ws) patch grid.
+        lq_features=None,
         # --- Feature extraction for GAN discriminator ---
         feature_indices=None,
         return_features_early: bool = False,
@@ -293,8 +301,10 @@ class PidNet(PixDiT_T2I):
         L_local = L // cp_size
 
         # Compute LQ features (split along L internally when CP is active).
-        has_lq = lq_video_or_image is not None or lq_latent is not None
-        lq_features = self._compute_lq_features(lq_video_or_image, lq_latent, lq_mask, Hs, Ws) if has_lq else None
+        # Precomputed features (from the tiled decoder) bypass projection entirely.
+        if lq_features is None:
+            has_lq = lq_video_or_image is not None or lq_latent is not None
+            lq_features = self._compute_lq_features(lq_video_or_image, lq_latent, lq_mask, Hs, Ws) if has_lq else None
 
         collected_features = None  # populated by _run_patch_blocks when feature_indices is set
 

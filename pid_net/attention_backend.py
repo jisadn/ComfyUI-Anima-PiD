@@ -32,6 +32,24 @@ try:
 except ImportError:
     _sageattn = None
 
+# Sage's INT8 quant entry (`quant_per_warp_int8_cuda`) is a raw pybind kernel with
+# no meta/fake registration, so Dynamo can't trace it: calling `_sageattn` directly
+# inside a compiled block graph-breaks (splits the block around the attention) and
+# warns once per call site. Wrapping it as an opaque custom op with a fake kernel
+# (HND in == HND out, same shape/dtype as q) keeps it a single node IN the graph, so
+# each block stays one graph. Inference runs under no_grad, so no backward needed.
+if _sageattn is not None:
+
+    @torch.library.custom_op("anima_pid::sage_attn", mutates_args=())
+    def _sage_attn_op(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        return _sageattn(q, k, v, tensor_layout="HND", is_causal=False)
+
+    @_sage_attn_op.register_fake
+    def _(q, k, v):
+        return torch.empty_like(q)
+else:
+    _sage_attn_op = None
+
 # Head dims sage handles natively. PiD's pixel attention is 72 (1152/16) — not in
 # the set — so it transparently falls back to SDPA; patch + joint attention (64)
 # are the long-sequence, compute-heavy ones sage actually accelerates.
@@ -85,9 +103,10 @@ def attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, attn_mask=None)
     # the helper stays correct everywhere (e.g. masked training, CPU smoke tests).
     fast_ok = attn_mask is None and q.is_cuda and q.dtype in (torch.float16, torch.bfloat16)
 
-    if backend == "sage" and fast_ok and _sageattn is not None and q.shape[-1] in _SAGE_HEAD_DIMS:
-        # sage "HND" layout == [B, H, S, D]: true drop-in, no transpose.
-        return _sageattn(q, k, v, tensor_layout="HND", is_causal=False)
+    if backend == "sage" and fast_ok and _sage_attn_op is not None and q.shape[-1] in _SAGE_HEAD_DIMS:
+        # sage "HND" layout == [B, H, S, D]: true drop-in, no transpose. Routed
+        # through the custom op so it stays traceable under torch.compile.
+        return _sage_attn_op(q, k, v)
 
     if backend == "flash" and fast_ok and _flash_attn_func is not None:
         # flash_attn_func wants [B, S, H, D]; transpose in and back.

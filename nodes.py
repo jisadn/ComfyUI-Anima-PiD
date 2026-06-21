@@ -314,6 +314,10 @@ class AnimaPiDDecode:
         pbar = ProgressBar(steps * n_tiles)
         step_cb = lambda: pbar.update(1)  # noqa: E731
         if use_tiling:
+            # global_lq defaults True: the LQ projection runs once over the full
+            # latent so its GroupNorm sees whole-image statistics, keeping the tiled
+            # tone aligned with the whole-image decode. The bundled color calib is
+            # fit through this same path (see metadata global_lq/tile_latent).
             px = pid_decode_latent_tiled(
                 net, lq, steps=steps, sigma=sigma, seed=seed,
                 tile=tile_latent, overlap=tile_overlap, dtype=dt, compile=compile,

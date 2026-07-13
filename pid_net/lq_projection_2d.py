@@ -9,9 +9,12 @@
 #                  to the patch grid without any interpolation.
 #   Latent branch: Nearest interpolate or fold to align to the patch grid.
 #
-# ControlNet-style injection gate (single implementation):
-#   "sigma_aware_per_token_per_dim":
-#       x + sigmoid(Linear([x, lq]) - exp(log_alpha)*sigma) * lq  (per-token per-dim, B,N,D; monotonic in sigma)
+# ControlNet-style injection gate (two variants, selected by gate_type):
+#   "sigma_aware_per_token_per_dim":  (PiD v1)
+#       x + sigmoid(Linear([x, lq]) - exp(log_alpha)*sigma) * lq  (per-token per-dim, B,N,D)
+#   "sigma_aware_per_token":          (PiD v1.5 — same math, content_proj → 1 channel)
+#       x + sigmoid(Linear([x, lq]) - exp(log_alpha)*sigma) * lq  (per-token scalar, B,N,1)
+# Both are monotonic in sigma.
 
 import math
 from typing import List, Optional
@@ -20,13 +23,50 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+_VALID_CONV_PADDING_MODES = {"zeros", "reflect", "replicate", "circular"}
+
+
+def _validate_conv_padding_mode(conv_padding_mode: str) -> None:
+    if conv_padding_mode not in _VALID_CONV_PADDING_MODES:
+        raise ValueError(
+            f"conv_padding_mode must be one of {sorted(_VALID_CONV_PADDING_MODES)}, got {conv_padding_mode!r}"
+        )
+
+
 # ---------------------------------------------------------------------------
-# Gate module
+# Gate modules
 # ---------------------------------------------------------------------------
+
+
+class SigmaAwarePerTokenGate(nn.Module):
+    """Per-token scalar sigma-aware gate. Used in PiD v1.5, reducing gate parameters.
+
+    Init: content_proj.bias=2.0, log_alpha=log(5) →
+          gate ≈ sigmoid(2.0 - 5*sigma): ~0.88 at sigma=0, ~0.5 at sigma=0.4, ~0.05 at sigma=1.
+    Requires sigma to always be provided (asserts at forward time).
+    """
+
+    def __init__(self, dim: int):
+        super().__init__()
+        self.content_proj = nn.Linear(dim * 2, 1)
+        nn.init.trunc_normal_(self.content_proj.weight, std=0.01)
+        nn.init.constant_(self.content_proj.bias, 2.0)
+        self.log_alpha = nn.Parameter(torch.tensor(math.log(5.0)))
+
+    def compute_gate_scalar(
+        self, x: torch.Tensor, lq: torch.Tensor, sigma: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        assert sigma is not None, "SigmaAwarePerTokenGate requires sigma input"
+        content_logit = self.content_proj(torch.cat([x, lq], dim=-1))  # (B, N, 1)
+        sigma_offset = -self.log_alpha.exp() * sigma.float().view(-1, 1, 1)  # (B, 1, 1)
+        return torch.sigmoid(content_logit + sigma_offset)  # (B, N, 1)
+
+    def forward(self, x: torch.Tensor, lq: torch.Tensor, sigma: Optional[torch.Tensor] = None) -> torch.Tensor:
+        return x + self.compute_gate_scalar(x, lq, sigma) * lq
 
 
 class SigmaAwareGatePerTokenPerDim(nn.Module):
-    """Per-token per-dim variant of SigmaAwareGatePerTokenPerDim.
+    """Per-token per-dim sigma-aware gate. Used in PiD v1.
 
     Content branch projects to dim instead of 1, so the gate is independent per
     (token, channel) instead of shared across channels. Sigma branch stays scalar
@@ -56,14 +96,22 @@ class SigmaAwareGatePerTokenPerDim(nn.Module):
         return x + self.compute_gate_scalar(x, lq, sigma) * lq
 
 
+_GATE_TYPES = {
+    "sigma_aware_per_token": SigmaAwarePerTokenGate,
+    "sigma_aware_per_token_per_dim": SigmaAwareGatePerTokenPerDim,
+}
 _SUPPORTED_GATE_TYPE = "sigma_aware_per_token_per_dim"
 
 
 def _build_gate(gate_type: str, dim: int, zero_init: bool = True) -> nn.Module:
     # zero_init is intentionally not forwarded: redundant with zero-init output_heads.
-    if gate_type != _SUPPORTED_GATE_TYPE:
-        raise ValueError(f"Unknown gate_type: {gate_type!r}. Only {_SUPPORTED_GATE_TYPE!r} is supported.")
-    return SigmaAwareGatePerTokenPerDim(dim)
+    try:
+        cls = _GATE_TYPES[gate_type]
+    except KeyError:
+        raise ValueError(
+            f"Unknown gate_type: {gate_type!r}. Must be one of {sorted(_GATE_TYPES)}."
+        ) from None
+    return cls(dim)
 
 
 # ---------------------------------------------------------------------------
@@ -74,15 +122,17 @@ def _build_gate(gate_type: str, dim: int, zero_init: bool = True) -> nn.Module:
 class ResBlock(nn.Module):
     """Pre-activation residual block: GroupNorm → SiLU → Conv → GroupNorm → SiLU → Conv + skip."""
 
-    def __init__(self, channels: int, num_groups: int = 4):
+    def __init__(self, channels: int, num_groups: int = 4, conv_padding_mode: str = "zeros"):
         super().__init__()
+        _validate_conv_padding_mode(conv_padding_mode)
+        self.conv_padding_mode = conv_padding_mode
         self.block = nn.Sequential(
             nn.GroupNorm(num_groups, channels),
             nn.SiLU(),
-            nn.Conv2d(channels, channels, kernel_size=3, padding=1),
+            nn.Conv2d(channels, channels, kernel_size=3, padding=1, padding_mode=conv_padding_mode),
             nn.GroupNorm(num_groups, channels),
             nn.SiLU(),
-            nn.Conv2d(channels, channels, kernel_size=3, padding=1),
+            nn.Conv2d(channels, channels, kernel_size=3, padding=1, padding_mode=conv_padding_mode),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -127,9 +177,11 @@ class LQProjection2D(nn.Module):
             4 = recommended for stronger feature extraction (~4x deeper).
         num_outputs: number of output feature sets — one per transformer block
             for controlnet injection.
-        gate_type: must be "sigma_aware_per_token_per_dim" (sigma-conditioned per-token per-dim gate).
+        gate_type: "sigma_aware_per_token" (v1.5) | "sigma_aware_per_token_per_dim" (v1).
         interval: inject every N blocks (only relevant when num_outputs > 1).
         zero_init: if True, zero-init all output projections for safe pretrained start.
+        conv_padding_mode: padding mode for all Conv2d layers in image / latent / merge branches.
+            v1.5 uses "replicate" — this is what removes the corner grid artifacts.
         pit_output: if True, add a dedicated output head for PiT block injection.
             The PiT head output is appended as the last element of forward() output.
     """
@@ -148,10 +200,12 @@ class LQProjection2D(nn.Module):
         gate_type: str = _SUPPORTED_GATE_TYPE,
         interval: int = 1,
         zero_init: bool = True,
+        conv_padding_mode: str = "zeros",
         pit_output: bool = False,
     ):
         super().__init__()
         assert in_channels > 0 or latent_channels > 0, "At least one of in_channels or latent_channels must be > 0"
+        _validate_conv_padding_mode(conv_padding_mode)
 
         self.in_channels = in_channels
         self.latent_channels = latent_channels
@@ -163,6 +217,7 @@ class LQProjection2D(nn.Module):
         self.num_outputs = num_outputs
         self.interval = interval
         self.zero_init = zero_init
+        self.conv_padding_mode = conv_padding_mode
         self.pit_output = pit_output
 
         # --- Image branch ---
@@ -174,12 +229,16 @@ class LQProjection2D(nn.Module):
             self.image_unshuffle_factor = patch_size // sr_scale
             unshuffle_ch = in_channels * self.image_unshuffle_factor**2
             layers = [
-                nn.Conv2d(unshuffle_ch, hidden_dim, kernel_size=3, stride=1, padding=1),
+                nn.Conv2d(
+                    unshuffle_ch, hidden_dim, kernel_size=3, stride=1, padding=1, padding_mode=conv_padding_mode
+                ),
                 nn.SiLU(),
-                nn.Conv2d(hidden_dim, hidden_dim, kernel_size=3, stride=1, padding=1),
+                nn.Conv2d(
+                    hidden_dim, hidden_dim, kernel_size=3, stride=1, padding=1, padding_mode=conv_padding_mode
+                ),
             ]
             for _ in range(num_res_blocks):
-                layers.append(ResBlock(hidden_dim))
+                layers.append(ResBlock(hidden_dim, conv_padding_mode=conv_padding_mode))
             self.image_conv = nn.Sequential(*layers)
         else:
             self.image_conv = None
@@ -210,12 +269,16 @@ class LQProjection2D(nn.Module):
                 latent_proj_in_ch = latent_channels * fold_factor**2
 
             layers = [
-                nn.Conv2d(latent_proj_in_ch, hidden_dim, kernel_size=3, stride=1, padding=1),
+                nn.Conv2d(
+                    latent_proj_in_ch, hidden_dim, kernel_size=3, stride=1, padding=1, padding_mode=conv_padding_mode
+                ),
                 nn.SiLU(),
-                nn.Conv2d(hidden_dim, hidden_dim, kernel_size=3, stride=1, padding=1),
+                nn.Conv2d(
+                    hidden_dim, hidden_dim, kernel_size=3, stride=1, padding=1, padding_mode=conv_padding_mode
+                ),
             ]
             for _ in range(num_res_blocks):
-                layers.append(ResBlock(hidden_dim))
+                layers.append(ResBlock(hidden_dim, conv_padding_mode=conv_padding_mode))
             self.latent_proj = nn.Sequential(*layers)
         else:
             self.latent_proj = None
@@ -224,9 +287,12 @@ class LQProjection2D(nn.Module):
 
         # --- Merge + shared ResBlocks (if both branches active) ---
         if in_channels > 0 and latent_channels > 0:
-            layers = [nn.Conv2d(hidden_dim * 2, hidden_dim, kernel_size=1), nn.SiLU()]
+            layers = [
+                nn.Conv2d(hidden_dim * 2, hidden_dim, kernel_size=1, padding_mode=conv_padding_mode),
+                nn.SiLU(),
+            ]
             for _ in range(num_res_blocks):
-                layers.append(ResBlock(hidden_dim))
+                layers.append(ResBlock(hidden_dim, conv_padding_mode=conv_padding_mode))
             self.merge = nn.Sequential(*layers)
         else:
             self.merge = None

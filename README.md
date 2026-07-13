@@ -34,6 +34,39 @@ There is **no second KSampler** and your Anima model does **not** connect to PiD
 PiD runs its own internal 4-step pixel diffusion. Output size = `latent_grid × 8 × 4`
 (e.g. a 64×64 latent → 2048×2048; a 128×128 latent → 4096×4096).
 
+## Checkpoint: PiD v1.5
+
+The node now fetches the **v1.5** qwenimage checkpoint
+(`PiD_v1pt5_res2kto4k_sr4x_official_qwenimage_distill_4step`, released 2026-07-09).
+Upstream's v1.5 changes, all of which matter here:
+
+- **better colour accuracy** — which is why `use_calib` is now **off** by default
+  (the bundled calib was fitted against v1's drift; see the node options below),
+- **no grid artifacts in the corners** — the LQ projection now uses `replicate`
+  conv padding instead of zero padding,
+- **trained with more anime data and small-face data**.
+
+Architecturally v1.5 is *not* a drop-in reload: it widens the LQ trunk
+(`lq_hidden_dim` 512 → 1024), swaps the injection gate from per-token-per-dim to a
+cheaper **per-token scalar** gate, moves the RoPE reference to the 2048 training
+resolution, and adds a dedicated **LQ injection into the PiT pixel blocks**. The
+loader picks the matching architecture **from the checkpoint itself**, so a
+hand-placed v1 file still loads (it is detected by the absence of `lq_proj.pit_head`).
+
+> The pre-v1.5 checkpoint moved to `checkpoints_deprecated/` upstream, so the path
+> older versions of this node auto-downloaded now 404s. Update the node.
+
+### Why "4×" when the name says "2k→4k"
+
+`sr4x` is the **scale factor** and `res2kto4k` is the **trained output range** — they
+are not the same number. PiD upscales **4× relative to the source latent's native VAE
+decode** (output = `latent_grid × 8 × 4`), and the weights are built around that:
+the LQ projection's pixel-unshuffle factor is `patch_size // sr_scale = 4`, so the
+scale is baked into the tensor shapes and is not a knob. `res2kto4k` says the model
+was trained to *emit* 2048–4096px, i.e. for source latents of 512–1024px. A 1024px
+Anima generation → 4096px out, which is the intended operating point. Feeding a
+2048px generation would ask for 8192px — outside the trained range.
+
 ## Install
 
 1. Copy/clone this folder into `ComfyUI/custom_nodes/`.
@@ -44,9 +77,9 @@ PiD runs its own internal 4-step pixel diffusion. Output size = `latent_grid × 
    into `ComfyUI/models/pid/` and select it from the dropdown:
    ```bash
    hf download nvidia/PiD --local-dir /tmp/pid \
-     --include "checkpoints/PiD_res2kto4k_sr4x_official_qwenimage_distill_4step/*"
+     --include "checkpoints/PiD_v1pt5_res2kto4k_sr4x_official_qwenimage_distill_4step/*"
    mkdir -p ComfyUI/models/pid
-   cp /tmp/pid/checkpoints/PiD_res2kto4k_sr4x_official_qwenimage_distill_4step/model_ema_bf16.pth \
+   cp /tmp/pid/checkpoints/PiD_v1pt5_res2kto4k_sr4x_official_qwenimage_distill_4step/model_ema_bf16.pth \
       ComfyUI/models/pid/pid_qwenimage_2kto4k_4step.pth
    ```
    (The Qwen VAE and gemma are **not** needed at decode time — PiD emits pixels
@@ -68,14 +101,14 @@ PiD runs its own internal 4-step pixel diffusion. Output size = `latent_grid × 
     output resolution**. With tiling on, every tile is the same size so it
     compiles once and all tiles reuse the graph — keep `tile_latent` fixed across
     runs to keep hitting the cache.
-  - `use_calib` (default **on**) — apply the bundled **color-match transform**
-    (`pid_color_calib.safetensors`) after decode. The `qwenimage` PiD checkpoint
-    decodes slightly **flat and desaturated** vs the native Qwen VAE (a known PiD
-    color drift — fixed upstream only for the `flux2 _2606` checkpoint, not for
-    `qwenimage`). The transform is a static linear `out = (rgb @ M.T + b)` fit
-    against native-VAE decodes; it corrects the *systematic* drift (contrast
-    ≈ ×1.11, saturation ≈ ×1.12, no hue tint). Turn off for raw PiD output. See
-    **Provenance**.
+  - `use_calib` (default **off**) — apply the bundled **color-match transform**
+    (`pid_color_calib.safetensors`) after decode. It was fitted against the
+    **pre-v1.5** `qwenimage` checkpoint, which decoded **flat and desaturated** vs
+    the native Qwen VAE. **PiD v1.5 fixes colour accuracy upstream**, so the
+    transform is off by default — stacking it on v1.5 would over-correct. Turn it
+    on only if you are running a hand-placed v1 checkpoint. The transform is a
+    static linear `out = (rgb @ M.T + b)` fit against native-VAE decodes (contrast
+    ≈ ×1.11, saturation ≈ ×1.12, no hue tint). See **Provenance**.
 
 ## Latent convention
 
@@ -124,8 +157,9 @@ null. To regenerate (only needed if upstream changes the chi_prompt):
    `[0] + list(range(-299, 0))` → `(1, 300, 2304)`; save bf16 under key
    `null_caption_embs`.
 
-**Bundled color calib** (`pid_color_calib.safetensors`) corrects this checkpoint's
-flat/desaturated drift vs the native Qwen VAE. Keys: `linear_M` (3×3), `linear_b`
+**Bundled color calib** (`pid_color_calib.safetensors`) corrects the **v1**
+checkpoint's flat/desaturated drift vs the native Qwen VAE; it is **not** applied to
+v1.5 by default, which fixes colour upstream. Keys: `linear_M` (3×3), `linear_b`
 (3,); applied as `out = (rgb01 @ linear_M.T + linear_b).clamp(0,1)`. To regenerate
 (e.g. after a checkpoint or step-count change — the drift is timestep-dependent),
 run the fitter in the `anima_lora` repo:

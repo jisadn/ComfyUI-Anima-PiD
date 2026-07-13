@@ -32,8 +32,16 @@ import torch
 
 from .pid_net import PidNet
 
-# ---- Exact PidNet constructor kwargs (introspected from the live qwenimage ckpt) ----
-NET_KWARGS = dict(
+# ---- Exact PidNet constructor kwargs, per checkpoint generation ----
+# Mirrors PID_SR4X / PID_SR4X_V1PT5 in the upstream config
+# (pid/_src/configs/common/defaults/net.py). v1 is the original 2kto4k release
+# (now under checkpoints_deprecated/ on the Hub); v1.5 is the current one.
+#
+# `sr_scale=4` is the architectural SR factor — output = latent_grid * 8 (VAE) * 4,
+# i.e. 4x the source latent's *native VAE decode*, NOT 4x of 2k. The "res2kto4k" in
+# the checkpoint name is the trained HQ output range (2048-4096px), which maps to a
+# source latent of 512-1024px. A 1024px generation decodes to 4096px.
+NET_KWARGS_V1 = dict(
     in_channels=3, num_groups=24, hidden_size=1536, pixel_hidden_size=16,
     pixel_attn_hidden_size=1152, pixel_num_groups=16, patch_depth=14, pixel_depth=2,
     num_text_blocks=4, patch_size=16, txt_embed_dim=2304, txt_max_length=300,
@@ -42,10 +50,38 @@ NET_KWARGS = dict(
     ed_compress_ratio=1, ed_depth_per_stage=1, ed_window_size=2, ed_num_heads=None,
     ed_hidden_size=None, ed_use_token_shuffle=True, lq_inject_mode="controlnet",
     lq_in_channels=0, lq_latent_channels=16, lq_hidden_dim=512, lq_num_res_blocks=4,
-    lq_gate_type="sigma_aware_per_token_per_dim", lq_interval=2, zero_init_lq=True,
-    train_lq_proj_only=False, sr_scale=4, latent_spatial_down_factor=8,
-    pit_lq_inject=False, pit_lq_gate_type="sigma_aware_per_token_per_dim",
+    lq_conv_padding_mode="zeros", lq_gate_type="sigma_aware_per_token_per_dim",
+    lq_interval=2, zero_init_lq=True, train_lq_proj_only=False, sr_scale=4,
+    latent_spatial_down_factor=8, pit_lq_inject=False,
 )
+
+# PiD v1.5 deltas: replicate conv padding (kills the corner grid artifacts), rope
+# reference at the 2048 training res, a wider LQ trunk, the cheaper per-token scalar
+# gate, and LQ injection into the PiT pixel blocks.
+# (lq_aux_rgb_head=True upstream is a training-only head — its weights are not in the
+# released EMA, so it is not built here.)
+NET_KWARGS_V1PT5 = dict(
+    NET_KWARGS_V1,
+    rope_ref_h=2048, rope_ref_w=2048,
+    lq_hidden_dim=1024,
+    lq_conv_padding_mode="replicate",
+    lq_gate_type="sigma_aware_per_token",
+    pit_lq_inject=True,
+)
+
+# Default for a freshly-fetched official checkpoint.
+NET_KWARGS = NET_KWARGS_V1PT5
+
+
+def net_kwargs_for_state_dict(sd: dict) -> dict:
+    """Pick the PidNet kwargs matching a checkpoint's actual architecture.
+
+    v1.5 is identified by its dedicated PiT injection head (`lq_proj.pit_head`), which
+    v1 does not have. This keeps a hand-placed v1 checkpoint (the deprecated Hub copy)
+    loadable alongside the current official one, instead of failing with a shape error.
+    """
+    keys = {k[len("net."):] if k.startswith("net.") else k for k in sd}
+    return NET_KWARGS_V1PT5 if "lq_proj.pit_head.weight" in keys else NET_KWARGS_V1
 
 SR_SCALE = 4
 VAE_DOWN = 8           # latent grid -> vae-native pixels
@@ -69,23 +105,12 @@ QWEN_LATENTS_STD = [2.8184, 1.4541, 2.3275, 2.6558, 1.2196, 1.7708, 2.6052, 2.07
                     3.2687, 2.1526, 2.8652, 1.5579, 1.6382, 1.1253, 2.8251, 1.9160]
 
 
-def build_pid_net(device="cuda", dtype=torch.bfloat16) -> PidNet:
-    net = PidNet(**NET_KWARGS)
-    net = net.to(device=device, dtype=dtype).eval().requires_grad_(False)
-    return net
+def read_pid_state_dict(ckpt_path: str) -> dict:
+    """Read a consolidated PiD checkpoint into a bare state dict.
 
-
-def load_pid_weights(net: PidNet, ckpt_path: str):
-    """Load consolidated PiD checkpoint. The official `model_ema_bf16.pth` stores
-    keys under a `net.` prefix (PixelDiTModel.state_dict(prefix='net.')); strip it.
-    Also tolerates a bare-key state dict and a {'state_dict'/'model': ...} wrapper.
-
-    Returns (missing, unexpected) where `missing` is split-categorized by the caller.
-    The load is necessarily `strict=False` (the official student legitimately omits
-    `lq_proj` keys — see PidDistillModel.load_state_dict), but that also means a wrong
-    NET_KWARGS would load silently. `categorize_load_keys` lets the loader surface a
-    real arch/kwargs mismatch (any non-`lq_proj` missing, or *any* unexpected key)
-    loudly instead of hiding it behind the expected lq_proj omissions."""
+    The official `model_ema_bf16.pth` stores keys under a `net.` prefix
+    (PixelDiTModel.state_dict(prefix='net.')); strip it. Also tolerates a bare-key
+    state dict and a {'state_dict'/'model': ...} wrapper."""
     sd = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     if isinstance(sd, dict) and "state_dict" in sd and isinstance(sd["state_dict"], dict):
         sd = sd["state_dict"]
@@ -93,6 +118,24 @@ def load_pid_weights(net: PidNet, ckpt_path: str):
         sd = sd["model"]
     if any(k.startswith("net.") for k in sd):
         sd = {k[len("net."):]: v for k, v in sd.items() if k.startswith("net.")}
+    return sd
+
+
+def build_pid_net(device="cuda", dtype=torch.bfloat16, net_kwargs: dict = None) -> PidNet:
+    net = PidNet(**(net_kwargs or NET_KWARGS))
+    net = net.to(device=device, dtype=dtype).eval().requires_grad_(False)
+    return net
+
+
+def load_pid_weights(net: PidNet, sd: dict):
+    """Load an already-read state dict (see `read_pid_state_dict`) into a PidNet.
+
+    Returns (missing, unexpected) where `missing` is split-categorized by the caller.
+    The load is necessarily `strict=False` (the official student legitimately omits
+    `lq_proj` keys — see PidDistillModel.load_state_dict), but that also means wrong
+    net kwargs would load silently. `categorize_load_keys` lets the loader surface a
+    real arch/kwargs mismatch (any non-`lq_proj` missing, or *any* unexpected key)
+    loudly instead of hiding it behind the expected lq_proj omissions."""
     missing, unexpected = net.load_state_dict(sd, strict=False)
     return missing, unexpected
 

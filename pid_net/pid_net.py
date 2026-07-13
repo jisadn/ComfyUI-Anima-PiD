@@ -81,6 +81,7 @@ class PidNet(PixDiT_T2I):
         lq_latent_channels: int = 0,
         lq_hidden_dim: int = 512,
         lq_num_res_blocks: int = 4,
+        lq_conv_padding_mode: str = "zeros",
         lq_gate_type: str = "sigma_aware_per_token_per_dim",
         lq_interval: int = 1,
         zero_init_lq: bool = True,
@@ -90,8 +91,8 @@ class PidNet(PixDiT_T2I):
         # --- PiT LQ injection args ---
         # Inject LQ features into PiT pixel blocks via a dedicated output head
         # from the same LQ projection CNN backbone. Added to s_cond before PiT loop.
+        # The PiT gate uses the same gate type as lq_gate_type (upstream behaviour).
         pit_lq_inject: bool = False,
-        pit_lq_gate_type: str = "sigma_aware_per_token_per_dim",
     ):
         super().__init__(
             in_channels=in_channels,
@@ -145,6 +146,7 @@ class PidNet(PixDiT_T2I):
             gate_type=lq_gate_type,
             interval=lq_interval,
             zero_init=zero_init_lq,
+            conv_padding_mode=lq_conv_padding_mode,
             pit_output=pit_lq_inject,
         )
 
@@ -152,7 +154,7 @@ class PidNet(PixDiT_T2I):
         if pit_lq_inject:
             from .lq_projection_2d import _build_gate
 
-            self.pit_lq_gate = _build_gate(pit_lq_gate_type, hidden_size, zero_init=zero_init_lq)
+            self.pit_lq_gate = _build_gate(lq_gate_type, hidden_size, zero_init=zero_init_lq)
         else:
             self.pit_lq_gate = None
 
@@ -441,13 +443,17 @@ class PidNet(PixDiT_T2I):
                 s = torch.cat([s, s.new_zeros(B, pad_len, s.shape[2])], dim=1)
 
         # Pixel pathway with optional PiT LQ injection — operates on rank-local
-        # patches under CP. lq_features[-1] was already split along L in
-        # `_compute_lq_features`, so its B*L_local view lines up with s.
-        s_cond = s.reshape(B * L_local, self.hidden_size)
+        # patches under CP. lq_features[-1] is the dedicated PiT head output (the LQ
+        # projection appends it after the per-block features) and was already split
+        # along L in `_compute_lq_features`, so it lines up with s token-for-token.
+        #
+        # The gate must run on the 3D token tensor (B, L, D): it broadcasts sigma as
+        # (B, 1, 1), so handing it the flattened (B*L, D) view would broadcast against
+        # the token axis and blow the tensor up by a factor of B*L. Flatten AFTER.
+        s_cond_tokens = s
         if self.pit_lq_inject and lq_features is not None:
-            pit_lq = lq_features[-1].reshape(B * L_local, self.hidden_size)
-            sigma_flat = degrade_sigma.repeat_interleave(L_local) if degrade_sigma is not None else None
-            s_cond = self.pit_lq_gate(s_cond, pit_lq, sigma=sigma_flat)
+            s_cond_tokens = self.pit_lq_gate(s_cond_tokens, lq_features[-1], sigma=degrade_sigma)
+        s_cond = s_cond_tokens.reshape(B * L_local, self.hidden_size)
 
         # Pixel embedder runs on the full image (cheap; identical across CP
         # ranks). Reshape and slice to the rank-local subset of patches so that

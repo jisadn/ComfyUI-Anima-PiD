@@ -32,6 +32,7 @@ from comfy.utils import ProgressBar
 
 from .pid_core import (
     COLOR_CALIB_FILENAME,
+    NET_KWARGS_V1PT5,
     NULL_CAPTION_FILENAME,
     SR_SCALE,
     VAE_DOWN,
@@ -43,8 +44,10 @@ from .pid_core import (
     load_color_calib,
     load_null_caption_embs,
     load_pid_weights,
+    net_kwargs_for_state_dict,
     pid_decode_latent,
     pid_decode_latent_tiled,
+    read_pid_state_dict,
 )
 from .pid_net.attention_backend import set_attention_backend
 
@@ -57,19 +60,26 @@ folder_paths.add_model_folder_path("pid", _PID_DIR)
 # derived data), so gemma is never needed. Regen recipe in README "Provenance".
 _NULL_CAPTION_PATH = os.path.join(os.path.dirname(__file__), NULL_CAPTION_FILENAME)
 
-# PiD->native-VAE color-match transform — bundled with the node (~0.5 KB). The
-# qwenimage PiD checkpoint color-drifts (flat + desaturated) vs the native Qwen
-# VAE; this corrects it at decode time. Derived by anima_lora bench/pid/fit_color_calib.py.
+# PiD->native-VAE color-match transform — bundled with the node (~0.5 KB). It was
+# fitted against the v1 checkpoint, which color-drifts (flat + desaturated) vs the
+# native Qwen VAE. Derived by anima_lora bench/pid/fit_color_calib.py.
+#
+# It is OFF by default since v1.5: upstream fixed colour accuracy in the v1.5
+# weights, so stacking the v1-fitted correction on top would over-correct. Left as
+# an opt-in toggle for anyone still running a hand-placed v1 checkpoint.
 _COLOR_CALIB_PATH = os.path.join(os.path.dirname(__file__), COLOR_CALIB_FILENAME)
 
 _DTYPES = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}
 
-# Official 4-step qwenimage 2k->4k checkpoint on the (ungated, public) nvidia/PiD
+# Official PiD v1.5 4-step qwenimage checkpoint on the (ungated, public) nvidia/PiD
 # repo. Auto-fetched into models/pid/ on first use, flattened + renamed to a flat
 # filename so the dropdown contract stays uniform.
+#
+# NB the pre-v1.5 checkpoint this node used to fetch now lives under
+# checkpoints_deprecated/ upstream — the old path 404s, hence the pin below.
 _HF_PID_REPO = "nvidia/PiD"
-_HF_PID_FILE = "checkpoints/PiD_res2kto4k_sr4x_official_qwenimage_distill_4step/model_ema_bf16.pth"
-_OFFICIAL_CKPT = "PiD_res2kto4k_sr4x_official_qwenimage_distill_4step.pth"
+_HF_PID_FILE = "checkpoints/PiD_v1pt5_res2kto4k_sr4x_official_qwenimage_distill_4step/model_ema_bf16.pth"
+_OFFICIAL_CKPT = "PiD_v1pt5_res2kto4k_sr4x_official_qwenimage_distill_4step.pth"
 # Stable dropdown sentinel for the official auto-download. It is ALWAYS present in
 # the list (whether or not the file has been fetched), so a saved workflow that
 # selected it stays valid across restarts. Kept short and filename-free — load()
@@ -158,8 +168,8 @@ class AnimaPiDLoader:
         if path is None:
             raise FileNotFoundError(
                 f"PiD checkpoint {ckpt_name!r} not found under {_PID_DIR}. "
-                f"Download nvidia/PiD checkpoints/PiD_res2kto4k_sr4x_official_qwenimage_distill_4step/"
-                f"model_ema_bf16.pth and place it there, or select the auto-download entry."
+                f"Download nvidia/PiD {_HF_PID_FILE} and place it there, "
+                f"or select the auto-download entry."
             )
         dt = _DTYPES[dtype]
         # Build the net on the OFFLOAD (CPU) device, not the GPU — the same load/
@@ -171,20 +181,26 @@ class AnimaPiDLoader:
         # (e.g. the next KSampler run) needs the VRAM.
         load_device = mm.get_torch_device()
         offload_device = mm.unet_offload_device()
-        net = build_pid_net(offload_device, dt)
-        missing, unexpected = load_pid_weights(net, path)
+        # Architecture comes from the checkpoint, not from the filename — v1 and v1.5
+        # differ (gate shape, LQ trunk width, PiT injection), and a user may still have
+        # a hand-placed v1 file. Read the state dict first, then build to match it.
+        sd = read_pid_state_dict(path)
+        net_kwargs = net_kwargs_for_state_dict(sd)
+        is_v1pt5 = net_kwargs is NET_KWARGS_V1PT5
+        net = build_pid_net(offload_device, dt, net_kwargs)
+        missing, unexpected = load_pid_weights(net, sd)
         expected_missing, suspect_missing, unexpected = categorize_load_keys(missing, unexpected)
         if expected_missing:
             print(f"[AnimaPiD] note: {len(expected_missing)} expected lq_proj keys absent (distilled student).")
-        # Non-lq missing keys or ANY unexpected key mean NET_KWARGS in pid_core.py
-        # doesn't match this checkpoint's architecture — the strict=False load hid it.
+        # Non-lq missing keys or ANY unexpected key mean the net kwargs in pid_core.py
+        # don't match this checkpoint's architecture — the strict=False load hid it.
         if suspect_missing or unexpected:
             print(
-                f"[AnimaPiD] WARNING: checkpoint/architecture mismatch — NET_KWARGS in pid_core.py "
-                f"may be wrong for this checkpoint.\n"
+                f"[AnimaPiD] WARNING: checkpoint/architecture mismatch — the selected net kwargs "
+                f"in pid_core.py may be wrong for this checkpoint.\n"
                 f"  {len(suspect_missing)} unexpected MISSING keys (e.g. {suspect_missing[:3]})\n"
                 f"  {len(unexpected)} UNEXPECTED keys (e.g. {unexpected[:3]})\n"
-                f"  Decode may produce garbage. Verify NET_KWARGS against the checkpoint."
+                f"  Decode may produce garbage. Verify the net kwargs against the checkpoint."
             )
         # Hand the net to ComfyUI's model manager via a ModelPatcher (no patches —
         # we only want its load/offload lifecycle, not weight patching). With no
@@ -192,7 +208,10 @@ class AnimaPiDLoader:
         # evicts it whole when VRAM is needed, which is exactly the residency
         # convention we want for a decode-time model.
         patcher = comfy.model_patcher.ModelPatcher(net, load_device=load_device, offload_device=offload_device)
-        print(f"[AnimaPiD] loaded {ckpt_name} as {dtype} (offload={offload_device}, load={load_device}; ComfyUI-managed)")
+        print(
+            f"[AnimaPiD] loaded {ckpt_name} as {dtype} "
+            f"(arch={'v1.5' if is_v1pt5 else 'v1'}, offload={offload_device}, load={load_device}; ComfyUI-managed)"
+        )
         return (AnimaPiDModel(patcher, dt),)
 
 
@@ -221,12 +240,13 @@ class AnimaPiDDecode:
                                                    "breaks than whole-net — mirrors Anima Block Compile). First run "
                                                    "per output size is slow (compilation), then fast; with tiling on "
                                                    "all tiles share one size so the blocks compile once."}),
-                "use_calib": ("BOOLEAN", {"default": True,
+                "use_calib": ("BOOLEAN", {"default": False,
                                           "tooltip": "Apply the bundled PiD->native-VAE color-match transform after "
-                                                     "decode. The qwenimage PiD checkpoint decodes slightly flat and "
-                                                     "desaturated vs the native Qwen VAE (a known PiD drift, fixed "
-                                                     "upstream only for the flux2 checkpoint); this corrects the "
-                                                     "systematic part. Turn off for raw PiD output."}),
+                                                     "decode. It was fitted against the pre-v1.5 qwenimage checkpoint, "
+                                                     "which decoded flat and desaturated vs the native Qwen VAE. v1.5 "
+                                                     "fixes colour accuracy upstream, so this is OFF by default — "
+                                                     "applying it on v1.5 would over-correct. Turn on only for a "
+                                                     "hand-placed v1 checkpoint."}),
                 "attention": (["auto", "sdpa", "flash", "sage"], {"default": "auto",
                                           "tooltip": "Attention backend for the PiD net. 'auto' honors ComfyUI's "
                                                      "--use-sage-attention / --use-flash-attention launch flags (sage "
@@ -282,7 +302,7 @@ class AnimaPiDDecode:
         return (M, b)
 
     def decode(self, pid_model, latent, steps, sigma, seed, tile_latent, tile_overlap,
-               compile=False, use_calib=True, attention="auto"):
+               compile=False, use_calib=False, attention="auto"):
         patcher = pid_model.patcher
         dt = pid_model.dtype
         load_device = patcher.load_device

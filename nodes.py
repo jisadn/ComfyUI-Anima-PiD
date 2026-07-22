@@ -69,7 +69,7 @@ _NULL_CAPTION_PATH = os.path.join(os.path.dirname(__file__), NULL_CAPTION_FILENA
 # an opt-in toggle for anyone still running a hand-placed v1 checkpoint.
 _COLOR_CALIB_PATH = os.path.join(os.path.dirname(__file__), COLOR_CALIB_FILENAME)
 
-_DTYPES = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}
+_DTYPES = {"fp8":torch.float8_e4m3fn,"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}
 
 # Official PiD v1.5 4-step qwenimage checkpoint on the (ungated, public) nvidia/PiD
 # repo. Auto-fetched into models/pid/ on first use, flattened + renamed to a flat
@@ -147,7 +147,7 @@ class AnimaPiDLoader:
         return {
             "required": {
                 "ckpt_name": (files,),
-                "dtype": (["bf16", "fp16", "fp32"], {"default": "bf16"}),
+                "dtype": (["fp8","bf16", "fp16", "fp32"], {"default": "fp8"}),
             }
         }
 
